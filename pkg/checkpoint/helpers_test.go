@@ -1,0 +1,7 @@
+package checkpoint_test
+
+import "os"
+
+func writeFile(path string, data []byte) error {
+	return os.WriteFile(path, data, 0o644)
+}
