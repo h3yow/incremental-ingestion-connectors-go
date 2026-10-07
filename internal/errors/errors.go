@@ -11,18 +11,22 @@ import (
 type Class string
 
 const (
-	ClassRegistrationConflict   Class = "registration_conflict"   // 连接器注册标识冲突
-	ClassDuplicateInit          Class = "duplicate_init"          // 数据源重复初始化
-	ClassMissingField           Class = "missing_field"           // 记录缺少必填字段
-	ClassTypeMismatch           Class = "type_mismatch"           // 记录字段类型不匹配
-	ClassPositionRegression     Class = "position_regression"     // 位点回退
-	ClassPositionOutOfRange     Class = "position_out_of_range"   // 位点越界
+	ClassRegistrationConflict   Class = "registration_conflict"    // 连接器注册标识冲突
+	ClassDuplicateInit          Class = "duplicate_init"           // 数据源重复初始化
+	ClassConfigMissing          Class = "config_missing"           // 数据源缺少必要配置
+	ClassConfigInvalid          Class = "config_invalid"           // 数据源配置值形态不对
+	ClassUnknownConnector       Class = "unknown_connector"        // 指定的数据源类型不存在
+	ClassMissingField           Class = "missing_field"            // 记录缺少必填字段
+	ClassTypeMismatch           Class = "type_mismatch"            // 记录字段类型不匹配
+	ClassParseError             Class = "parse_error"              // 整行/整文件无法按格式解析
+	ClassPositionRegression     Class = "position_regression"      // 位点回退
+	ClassPositionOutOfRange     Class = "position_out_of_range"    // 位点越界
 	ClassPositionSourceMismatch Class = "position_source_mismatch" // 位点与数据源不匹配
-	ClassSourceExhausted        Class = "source_exhausted"        // 数据源读取完毕
-	ClassSinkFailure            Class = "sink_failure"            // 下游写入失败
-	ClassBackpressureTimeout    Class = "backpressure_timeout"    // 背压等待超时
-	ClassCanceled               Class = "canceled"                // 上下文取消
-	ClassInternal               Class = "internal"                // 未分类内部错误
+	ClassSourceExhausted        Class = "source_exhausted"         // 数据源读取完毕
+	ClassSinkFailure            Class = "sink_failure"             // 下游写入失败
+	ClassBackpressureTimeout    Class = "backpressure_timeout"     // 背压等待超时
+	ClassCanceled               Class = "canceled"                 // 上下文取消
+	ClassInternal               Class = "internal"                 // 未分类内部错误
 )
 
 // Error 是框架对外暴露的唯一错误类型。

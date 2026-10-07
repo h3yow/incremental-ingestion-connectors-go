@@ -55,14 +55,14 @@ func (r *Registry) Register(kind string, f Factory) error {
 	return nil
 }
 
-// New 按类型构造 Source；未知类型返回错误并列出可用类型。
+// New 按类型构造 Source；未知类型返回 unknown_connector 并列出可用类型。
 func (r *Registry) New(kind string, cfg Config) (Source, error) {
 	const op = "connector.Registry.New"
 	r.mu.RLock()
 	f, ok := r.factories[kind]
 	r.mu.RUnlock()
 	if !ok {
-		return nil, ierr.Newf(ierr.ClassMissingField, op,
+		return nil, ierr.Newf(ierr.ClassUnknownConnector, op,
 			"unknown connector kind %q (registered: %v)", kind, r.Kinds())
 	}
 	src, err := f(cfg)

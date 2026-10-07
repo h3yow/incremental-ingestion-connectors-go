@@ -21,20 +21,22 @@ import (
 	"github.com/h3yow/incremental-ingestion-connectors-go/internal/connector"
 	ierr "github.com/h3yow/incremental-ingestion-connectors-go/internal/errors"
 	"github.com/h3yow/incremental-ingestion-connectors-go/internal/pipeline"
+	"github.com/h3yow/incremental-ingestion-connectors-go/internal/reject"
 	"github.com/h3yow/incremental-ingestion-connectors-go/internal/sink"
 )
 
 func main() {
 	var (
-		kind     = flag.String("kind", "jsonl", "connector kind (jsonl|csv)")
-		path     = flag.String("path", "", "source data file path")
-		name     = flag.String("name", "", "source instance name (default: <kind>:<path>)")
-		out      = flag.String("out", "out/events.jsonl", "output file path")
-		ckpt     = flag.String("ckpt", "out/checkpoint.json", "checkpoint file path")
-		workers  = flag.Int("workers", 4, "number of concurrent workers")
-		queue    = flag.Int("queue", 64, "queue capacity (backpressure boundary)")
-		batch    = flag.Int("batch", 16, "batch size")
-		verbose  = flag.Bool("v", false, "debug logging")
+		kind    = flag.String("kind", "jsonl", "connector kind (jsonl|csv)")
+		path    = flag.String("path", "", "source data file path")
+		name    = flag.String("name", "", "source instance name (default: <kind>:<path>)")
+		out     = flag.String("out", "out/events.jsonl", "output file path")
+		ckpt    = flag.String("ckpt", "out/checkpoint.json", "checkpoint file path")
+		rejects = flag.String("rejects", "out/rejects.jsonl", "reject record store path")
+		workers = flag.Int("workers", 4, "number of concurrent workers")
+		queue   = flag.Int("queue", 64, "queue capacity (backpressure boundary)")
+		batch   = flag.Int("batch", 16, "batch size")
+		verbose = flag.Bool("v", false, "debug logging")
 	)
 	flag.Parse()
 
@@ -44,13 +46,13 @@ func main() {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
-	if err := run(*kind, *path, *name, *out, *ckpt, *workers, *queue, *batch, log); err != nil {
+	if err := run(*kind, *path, *name, *out, *ckpt, *rejects, *workers, *queue, *batch, log); err != nil {
 		log.Error("ingest failed", "error_class", string(ierr.ClassOf(err)), "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(kind, path, name, out, ckpt string, workers, queue, batch int, log *slog.Logger) error {
+func run(kind, path, name, out, ckpt, rejectsPath string, workers, queue, batch int, log *slog.Logger) error {
 	reg := connector.NewRegistry()
 	for _, register := range []func(*connector.Registry) error{jsonl.Register, csv.Register} {
 		if err := register(reg); err != nil {
@@ -85,20 +87,32 @@ func run(kind, path, name, out, ckpt string, workers, queue, batch int, log *slo
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	rejects, err := reject.Open(rejectsPath)
+	if err != nil {
+		return err
+	}
+
 	p := pipeline.New(src, sk, store, pipeline.Options{
 		Workers:   workers,
 		QueueSize: queue,
 		BatchSize: batch,
+		Rejects:   rejects,
 		Logger:    log,
 	})
-	if err := p.Run(ctx); err != nil {
-		return err
+	runErr := p.Run(ctx)
+	sum := rejects.Summary()
+	if sum.Total > 0 {
+		log.Warn("reject summary", "total", sum.Total, "by_class", sum.ByClass, "store", rejectsPath)
+	}
+	if runErr != nil {
+		return runErr
 	}
 	log.Info("ingest finished",
 		"produced", p.Stats.Produced.Load(),
 		"written", p.Stats.Written.Load(),
 		"batches", p.Stats.Batches.Load(),
-		"committed", p.Stats.Committed.Load())
-	fmt.Fprintf(os.Stderr, "output: %s\ncheckpoint: %s\n", out, ckpt)
+		"committed", p.Stats.Committed.Load(),
+		"rejected", p.Stats.Rejected.Load())
+	fmt.Fprintf(os.Stderr, "output: %s\ncheckpoint: %s\nrejects: %s\n", out, ckpt, rejectsPath)
 	return nil
 }

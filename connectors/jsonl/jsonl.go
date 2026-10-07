@@ -28,9 +28,16 @@ func Register(r *connector.Registry) error {
 // New 是连接器工厂。
 func New(cfg connector.Config) (connector.Source, error) {
 	const op = "jsonl.New"
-	path, ok := cfg["path"].(string)
-	if !ok || path == "" {
-		return nil, ierr.New(ierr.ClassMissingField, op, `config field "path" (string) is required`)
+	raw, ok := cfg["path"]
+	if !ok {
+		return nil, ierr.New(ierr.ClassConfigMissing, op, `config field "path" (string) is required`)
+	}
+	path, ok := raw.(string)
+	if !ok {
+		return nil, ierr.Newf(ierr.ClassConfigInvalid, op, `config field "path" must be string, got %T`, raw)
+	}
+	if path == "" {
+		return nil, ierr.New(ierr.ClassConfigMissing, op, `config field "path" must not be empty`)
 	}
 	name, _ := cfg["name"].(string)
 	if name == "" {
@@ -128,7 +135,10 @@ func (s *source) nextLocked(ctx context.Context) (event.Record, checkpoint.Posit
 	}
 	var rec event.Record
 	if jerr := json.Unmarshal(trimSpace(line), &rec); jerr != nil {
-		return nil, checkpoint.Position{}, ierr.Wrap(ierr.ClassTypeMismatch, "jsonl.Next", jerr)
+		// 整行无法解析：归为 parse_error，并返回坏行之后的位点，
+		// 调用方登记拒绝后可从该位点继续，坏行不占用序号。
+		pos := checkpoint.Position{Source: s.name, Offset: s.offset, Seq: s.seq}
+		return nil, pos, ierr.Wrap(ierr.ClassParseError, "jsonl.Next", jerr)
 	}
 	s.seq++
 	return rec, checkpoint.Position{Source: s.name, Offset: s.offset, Seq: s.seq}, nil

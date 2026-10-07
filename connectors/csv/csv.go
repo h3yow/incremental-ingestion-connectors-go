@@ -31,9 +31,16 @@ func Register(r *connector.Registry) error {
 // New 是连接器工厂。
 func New(cfg connector.Config) (connector.Source, error) {
 	const op = "csv.New"
-	path, ok := cfg["path"].(string)
-	if !ok || path == "" {
-		return nil, ierr.New(ierr.ClassMissingField, op, `config field "path" (string) is required`)
+	raw, ok := cfg["path"]
+	if !ok {
+		return nil, ierr.New(ierr.ClassConfigMissing, op, `config field "path" (string) is required`)
+	}
+	path, ok := raw.(string)
+	if !ok {
+		return nil, ierr.Newf(ierr.ClassConfigInvalid, op, `config field "path" must be string, got %T`, raw)
+	}
+	if path == "" {
+		return nil, ierr.New(ierr.ClassConfigMissing, op, `config field "path" must not be empty`)
 	}
 	name, _ := cfg["name"].(string)
 	if name == "" {
@@ -46,15 +53,15 @@ type source struct {
 	name string
 	path string
 
-	mu      sync.Mutex
-	file    *os.File
-	reader  *bufio.Reader
-	header  []string
-	offset  int64
-	seq     uint64
-	size    int64
-	opened  bool
-	closed  bool
+	mu     sync.Mutex
+	file   *os.File
+	reader *bufio.Reader
+	header []string
+	offset int64
+	seq    uint64
+	size   int64
+	opened bool
+	closed bool
 }
 
 func (s *source) Name() string { return s.name }
@@ -96,7 +103,7 @@ func (s *source) Open(ctx context.Context, from checkpoint.Position) error {
 	header, err := parseLine(hdr)
 	if err != nil {
 		f.Close()
-		return ierr.Wrap(ierr.ClassTypeMismatch, op, err)
+		return ierr.Wrap(ierr.ClassParseError, op, err)
 	}
 	s.header = header
 	headerEnd := int64(len(hdr))
@@ -146,22 +153,29 @@ func (s *source) Next(ctx context.Context) (event.Record, checkpoint.Position, e
 		}
 		fields, err := parseLine(line)
 		if err != nil {
-			return nil, checkpoint.Position{}, ierr.Wrap(ierr.ClassTypeMismatch, op, err)
+			// 整行无法按 CSV 解析：parse_error，返回坏行之后的位点，调用方可跳过继续。
+			return nil, s.pos(), ierr.Wrap(ierr.ClassParseError, op, err)
 		}
 		rec, err := s.toRecord(fields)
 		if err != nil {
-			return nil, checkpoint.Position{}, err
+			// 行内容不合规：返回坏行之后的位点，调用方登记拒绝后继续。
+			return nil, s.pos(), err
 		}
 		s.seq++
 		return rec, checkpoint.Position{Source: s.name, Offset: s.offset, Seq: s.seq}, nil
 	}
 }
 
+// pos 返回当前读取位点（调用方已持有锁）。
+func (s *source) pos() checkpoint.Position {
+	return checkpoint.Position{Source: s.name, Offset: s.offset, Seq: s.seq}
+}
+
 // toRecord 按表头把一行字段映射为原始记录。
 func (s *source) toRecord(fields []string) (event.Record, error) {
 	const op = "csv.Next"
 	if len(fields) != len(s.header) {
-		return nil, ierr.Newf(ierr.ClassTypeMismatch, op,
+		return nil, ierr.Newf(ierr.ClassParseError, op,
 			"row has %d fields, header has %d", len(fields), len(s.header))
 	}
 	rec := event.Record{}

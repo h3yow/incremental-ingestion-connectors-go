@@ -101,18 +101,33 @@ func TestPositionMismatchAndOutOfRange(t *testing.T) {
 }
 
 func TestBadJSONRejected(t *testing.T) {
-	path := writeFile(t, "not-json\n")
+	// 整行无法解析：归类 parse_error，返回坏行之后的位点，后续记录可继续读
+	path := writeFile(t, "not-json\n{\"key\":\"b\",\"kind\":\"u\"}\n")
 	src := open(t, path, checkpoint.Position{Source: "test"})
 	defer src.Close()
-	_, _, err := src.Next(context.Background())
-	if !ierr.Is(err, ierr.ClassTypeMismatch) {
-		t.Fatalf("want type_mismatch, got %v", err)
+	_, pos, err := src.Next(context.Background())
+	if !ierr.Is(err, ierr.ClassParseError) {
+		t.Fatalf("want parse_error, got %v", err)
+	}
+	if pos.Offset <= 0 {
+		t.Fatalf("parse error must carry position past bad line, got %+v", pos)
+	}
+	rec, pos2, err := src.Next(context.Background())
+	if err != nil || rec["key"] != "b" {
+		t.Fatalf("next after bad line got %v %v", rec, err)
+	}
+	if pos2.Seq != 1 {
+		t.Fatalf("bad line must not consume seq, got seq=%d", pos2.Seq)
 	}
 }
 
 func TestMissingConfig(t *testing.T) {
-	_, err := New(connector.Config{})
-	if !ierr.Is(err, ierr.ClassMissingField) {
-		t.Fatalf("want missing_field, got %v", err)
+	// 缺少必要配置：config_missing
+	if _, err := New(connector.Config{}); !ierr.Is(err, ierr.ClassConfigMissing) {
+		t.Fatalf("want config_missing, got %v", err)
+	}
+	// 配置形态不对：config_invalid
+	if _, err := New(connector.Config{"path": 42}); !ierr.Is(err, ierr.ClassConfigInvalid) {
+		t.Fatalf("want config_invalid, got %v", err)
 	}
 }

@@ -35,9 +35,9 @@ func TestRegistry(t *testing.T) {
 	if err := r.Register("", factory); !ierr.Is(err, ierr.ClassRegistrationConflict) {
 		t.Fatalf("want registration_conflict, got %v", err)
 	}
-	// 未知类型
-	if _, err := r.New("nope", nil); err == nil {
-		t.Fatal("want error for unknown kind")
+	// 未知类型：与"缺少配置"区分开，便于运维判断是改配置还是换类型
+	if _, err := r.New("nope", nil); !ierr.Is(err, ierr.ClassUnknownConnector) {
+		t.Fatalf("want unknown_connector, got %v", err)
 	}
 	// 正常构造
 	src, err := r.New("fake", nil)
