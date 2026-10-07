@@ -30,7 +30,7 @@ func New(cfg connector.Config) (connector.Source, error) {
 	const op = "jsonl.New"
 	path, ok := cfg["path"].(string)
 	if !ok || path == "" {
-		return nil, ierr.New(ierr.ClassMissingField, op, `config field "path" (string) is required`)
+		return nil, ierr.New(ierr.ClassConfigInvalid, op, `config field "path" (string) is required`)
 	}
 	name, _ := cfg["name"].(string)
 	if name == "" {
@@ -128,7 +128,11 @@ func (s *source) nextLocked(ctx context.Context) (event.Record, checkpoint.Posit
 	}
 	var rec event.Record
 	if jerr := json.Unmarshal(trimSpace(line), &rec); jerr != nil {
-		return nil, checkpoint.Position{}, ierr.Wrap(ierr.ClassTypeMismatch, "jsonl.Next", jerr)
+		// 整行无法解析：坏记录同样占用一个序号，返回其后的位点，
+		// 调用方登记拒绝后可凭该位点跳过本行继续续读。
+		s.seq++
+		return nil, checkpoint.Position{Source: s.name, Offset: s.offset, Seq: s.seq},
+			ierr.Wrap(ierr.ClassRecordUnparseable, "jsonl.Next", jerr)
 	}
 	s.seq++
 	return rec, checkpoint.Position{Source: s.name, Offset: s.offset, Seq: s.seq}, nil

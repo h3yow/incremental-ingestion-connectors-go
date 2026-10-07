@@ -85,7 +85,43 @@ func TestBadPayloadRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer src.Close()
-	if _, _, err := src.Next(ctx); !ierr.Is(err, ierr.ClassTypeMismatch) {
-		t.Fatalf("want type_mismatch, got %v", err)
+	if _, _, err := src.Next(ctx); !ierr.Is(err, ierr.ClassRecordInvalid) {
+		t.Fatalf("want record_invalid, got %v", err)
+	}
+}
+
+// TestBadRowReturnsPositionAndContinues 覆盖：字段数不符的坏行返回 record_invalid 及
+// 其后的位点，跳过后续读不受影响。
+func TestBadRowReturnsPositionAndContinues(t *testing.T) {
+	t.Log("覆盖: CSV 坏行返回位点并可跳过续读")
+	path := writeFile(t, "key,kind\na,u\nonly-one-field\nb,u\n")
+	src, _ := New(connector.Config{"path": path, "name": "c"})
+	ctx := context.Background()
+	if err := src.Open(ctx, checkpoint.Position{Source: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+
+	if _, _, err := src.Next(ctx); err != nil {
+		t.Fatal(err)
+	}
+	_, pos, err := src.Next(ctx)
+	if !ierr.Is(err, ierr.ClassRecordInvalid) {
+		t.Fatalf("want record_invalid, got %v", err)
+	}
+	if pos.Seq != 2 {
+		t.Fatalf("bad row should carry its position, got %+v", pos)
+	}
+	rec, pos3, err := src.Next(ctx)
+	if err != nil || rec["key"] != "b" || pos3.Seq != 3 {
+		t.Fatalf("after skip got rec=%v pos=%+v err=%v", rec, pos3, err)
+	}
+	t.Logf("结果: 坏行位点 %+v 可跳过, 续读到 key=b", pos)
+}
+
+func TestMissingConfig(t *testing.T) {
+	_, err := New(connector.Config{})
+	if !ierr.Is(err, ierr.ClassConfigInvalid) {
+		t.Fatalf("want config_invalid, got %v", err)
 	}
 }

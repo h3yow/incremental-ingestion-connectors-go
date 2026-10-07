@@ -32,26 +32,26 @@ func TestNormalizeOK(t *testing.T) {
 
 func TestNormalizeMissingField(t *testing.T) {
 	_, err := Normalize("src", 1, Record{"kind": "upsert"})
-	if !ierr.Is(err, ierr.ClassMissingField) {
+	if !ierr.Is(err, ierr.ClassRecordInvalid) {
 		t.Fatalf("want missing_field, got %v", err)
 	}
 	_, err = Normalize("src", 1, Record{"key": "k"})
-	if !ierr.Is(err, ierr.ClassMissingField) {
+	if !ierr.Is(err, ierr.ClassRecordInvalid) {
 		t.Fatalf("want missing_field, got %v", err)
 	}
 }
 
 func TestNormalizeTypeMismatch(t *testing.T) {
 	_, err := Normalize("src", 1, Record{"key": 123, "kind": "upsert"})
-	if !ierr.Is(err, ierr.ClassTypeMismatch) {
+	if !ierr.Is(err, ierr.ClassRecordInvalid) {
 		t.Fatalf("want type_mismatch, got %v", err)
 	}
 	_, err = Normalize("src", 1, Record{"key": "k", "kind": "u", "payload": "not-a-map"})
-	if !ierr.Is(err, ierr.ClassTypeMismatch) {
+	if !ierr.Is(err, ierr.ClassRecordInvalid) {
 		t.Fatalf("want type_mismatch, got %v", err)
 	}
 	_, err = Normalize("src", 1, Record{"key": "k", "kind": "u", "ts": "not-a-time"})
-	if !ierr.Is(err, ierr.ClassTypeMismatch) {
+	if !ierr.Is(err, ierr.ClassRecordInvalid) {
 		t.Fatalf("want type_mismatch, got %v", err)
 	}
 }

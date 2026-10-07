@@ -11,19 +11,31 @@ import (
 type Class string
 
 const (
-	ClassRegistrationConflict   Class = "registration_conflict"   // 连接器注册标识冲突
-	ClassDuplicateInit          Class = "duplicate_init"          // 数据源重复初始化
-	ClassMissingField           Class = "missing_field"           // 记录缺少必填字段
-	ClassTypeMismatch           Class = "type_mismatch"           // 记录字段类型不匹配
-	ClassPositionRegression     Class = "position_regression"     // 位点回退
-	ClassPositionOutOfRange     Class = "position_out_of_range"   // 位点越界
+	ClassRegistrationConflict   Class = "registration_conflict"    // 连接器注册标识冲突
+	ClassDuplicateInit          Class = "duplicate_init"           // 数据源重复初始化
+	ClassConfigInvalid          Class = "config_invalid"           // 数据源配置写错或缺少必要配置
+	ClassUnknownConnectorKind   Class = "unknown_connector_kind"   // 指定的数据源类型不存在
+	ClassRecordInvalid          Class = "record_invalid"           // 记录内容不合规（必填缺失/字段形态不对）
+	ClassRecordUnparseable      Class = "record_unparseable"       // 整行/整文件无法按格式解析
+	ClassPositionRegression     Class = "position_regression"      // 位点回退
+	ClassPositionOutOfRange     Class = "position_out_of_range"    // 位点越界
 	ClassPositionSourceMismatch Class = "position_source_mismatch" // 位点与数据源不匹配
-	ClassSourceExhausted        Class = "source_exhausted"        // 数据源读取完毕
-	ClassSinkFailure            Class = "sink_failure"            // 下游写入失败
-	ClassBackpressureTimeout    Class = "backpressure_timeout"    // 背压等待超时
-	ClassCanceled               Class = "canceled"                // 上下文取消
-	ClassInternal               Class = "internal"                // 未分类内部错误
+	ClassSourceExhausted        Class = "source_exhausted"         // 数据源读取完毕
+	ClassSinkFailure            Class = "sink_failure"             // 下游写入失败
+	ClassBackpressureTimeout    Class = "backpressure_timeout"     // 背压等待超时
+	ClassCanceled               Class = "canceled"                 // 上下文取消
+	ClassInternal               Class = "internal"                 // 未分类内部错误
 )
+
+// IsRecordLevel 报告 err 是否为记录级错误（坏记录）。
+// 记录级错误可跳过续跑；其余错误均为致命错误。
+func IsRecordLevel(err error) bool {
+	switch ClassOf(err) {
+	case ClassRecordInvalid, ClassRecordUnparseable:
+		return true
+	}
+	return false
+}
 
 // Error 是框架对外暴露的唯一错误类型。
 type Error struct {

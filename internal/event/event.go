@@ -57,7 +57,7 @@ func Normalize(source string, seq uint64, rec Record) (Event, error) {
 	if v, ok := rec[FieldPayload]; ok {
 		p, ok := v.(map[string]any)
 		if !ok {
-			return Event{}, ierr.Newf(ierr.ClassTypeMismatch, op,
+			return Event{}, ierr.Newf(ierr.ClassRecordInvalid, op,
 				"field %q must be object, got %T", FieldPayload, v)
 		}
 		ev.Payload = p
@@ -65,12 +65,12 @@ func Normalize(source string, seq uint64, rec Record) (Event, error) {
 	if v, ok := rec[FieldTime]; ok {
 		s, ok := v.(string)
 		if !ok {
-			return Event{}, ierr.Newf(ierr.ClassTypeMismatch, op,
+			return Event{}, ierr.Newf(ierr.ClassRecordInvalid, op,
 				"field %q must be RFC3339 string, got %T", FieldTime, v)
 		}
 		t, err := time.Parse(time.RFC3339, s)
 		if err != nil {
-			return Event{}, ierr.Newf(ierr.ClassTypeMismatch, op,
+			return Event{}, ierr.Newf(ierr.ClassRecordInvalid, op,
 				"field %q is not valid RFC3339: %q", FieldTime, s)
 		}
 		ev.Time = t.UTC()
@@ -82,14 +82,14 @@ func requireString(rec Record, field string) (string, error) {
 	const op = "event.Normalize"
 	v, ok := rec[field]
 	if !ok {
-		return "", ierr.Newf(ierr.ClassMissingField, op, "required field %q is missing", field)
+		return "", ierr.Newf(ierr.ClassRecordInvalid, op, "required field %q is missing", field)
 	}
 	s, ok := v.(string)
 	if !ok {
-		return "", ierr.Newf(ierr.ClassTypeMismatch, op, "field %q must be string, got %T", field, v)
+		return "", ierr.Newf(ierr.ClassRecordInvalid, op, "field %q must be string, got %T", field, v)
 	}
 	if s == "" {
-		return "", ierr.Newf(ierr.ClassMissingField, op, "required field %q is empty", field)
+		return "", ierr.Newf(ierr.ClassRecordInvalid, op, "required field %q is empty", field)
 	}
 	return s, nil
 }

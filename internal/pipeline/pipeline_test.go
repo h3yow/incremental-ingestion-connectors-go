@@ -19,6 +19,7 @@ import (
 	"github.com/h3yow/incremental-ingestion-connectors-go/internal/connector"
 	ierr "github.com/h3yow/incremental-ingestion-connectors-go/internal/errors"
 	"github.com/h3yow/incremental-ingestion-connectors-go/internal/event"
+	"github.com/h3yow/incremental-ingestion-connectors-go/internal/reject"
 	"github.com/h3yow/incremental-ingestion-connectors-go/internal/sink"
 )
 
@@ -154,8 +155,8 @@ func TestDuplicateConsumptionNoDuplicateWrites(t *testing.T) {
 
 // failingSink 在第 failAfter 批之后持续失败。
 type failingSink struct {
-	mu       sync.Mutex
-	calls    int
+	mu        sync.Mutex
+	calls     int
 	failAfter int
 }
 
@@ -332,16 +333,182 @@ func TestThroughputScalesWithWorkers(t *testing.T) {
 	}
 }
 
-func TestRecordLevelErrorAborts(t *testing.T) {
-	// 含一条缺 key 的坏记录：必须明确拒绝，不静默跳过
+// runOnceWithRejects 用同一检查点/输出/拒绝文件跑一轮管线。
+func runOnceWithRejects(t *testing.T, srcPath, outPath, ckptPath, rejectPath string, workers int) (*Pipeline, error) {
+	t.Helper()
+	src, err := jsonl.New(connector.Config{"path": srcPath, "name": "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := checkpoint.NewFileStore(ckptPath)
+	pos, err := store.Load(context.Background(), src.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Open(context.Background(), pos); err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	sk := sink.NewFileSink(outPath)
+	defer sk.Close()
+	p := New(src, sk, store, Options{
+		Workers: workers, QueueSize: 8, BatchSize: 4,
+		RejectStore: reject.NewFileStore(rejectPath),
+		Logger:      testLogger(),
+	})
+	err = p.Run(context.Background())
+	return p, err
+}
+
+// writeMixedJSONL 生成好坏混合的源文件：3 条好记录 + 3 条坏记录（缺 key / 整行非 JSON / ts 形态错）。
+func writeMixedJSONL(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "mixed.jsonl")
+	content := `{"key":"a","kind":"upsert"}
+{"kind":"upsert"}
+this is not json at all
+{"key":"b","kind":"upsert","ts":"not-a-timestamp"}
+{"key":"c","kind":"upsert"}
+{"key":"d","kind":"upsert"}
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestBadRecordsRejectedAndSkipped(t *testing.T) {
+	t.Log("覆盖: 坏记录按类别拒掉并留痕, 本轮剩余好记录全部投递, 位点推进到源末尾")
 	dir := t.TempDir()
-	srcPath := filepath.Join(dir, "src.jsonl")
-	os.WriteFile(srcPath, []byte("{\"key\":\"a\",\"kind\":\"u\"}\n{\"kind\":\"u\"}\n{\"key\":\"c\",\"kind\":\"u\"}\n"), 0o644)
+	srcPath := writeMixedJSONL(t)
+	out := filepath.Join(dir, "out.jsonl")
+	ckpt := filepath.Join(dir, "ckpt.json")
+	rejects := filepath.Join(dir, "rejects.jsonl")
+
+	p, err := runOnceWithRejects(t, srcPath, out, ckpt, rejects, 2)
+	if err != nil {
+		t.Fatalf("bad records must not abort the run, got %v", err)
+	}
+	// 3 条好记录全部投递
+	if got := countLines(t, out); got != 3 {
+		t.Fatalf("want 3 good events delivered, got %d", got)
+	}
+	if p.Stats.Written.Load() != 3 || p.Stats.Rejected.Load() != 3 {
+		t.Fatalf("written=%d rejected=%d, want 3/3", p.Stats.Written.Load(), p.Stats.Rejected.Load())
+	}
+	// 位点推进到源末尾（seq=6，含坏记录占用的序号）
+	pos, _ := checkpoint.NewFileStore(ckpt).Load(context.Background(), "test")
+	if pos.Seq != 6 {
+		t.Fatalf("checkpoint seq=%d, want 6 (source end)", pos.Seq)
+	}
+	// 拒绝记录汇总：第几条、哪类原因，可查看
+	sum, err := reject.NewFileStore(rejects).Summary(context.Background(), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum[string(ierr.ClassRecordInvalid)] != 2 || sum[string(ierr.ClassRecordUnparseable)] != 1 {
+		t.Fatalf("reject summary=%v, want record_invalid=2 record_unparseable=1", sum)
+	}
+	list, _ := reject.NewFileStore(rejects).List(context.Background(), "test")
+	for _, r := range list {
+		t.Logf("拒绝记录: seq=%d offset=%d class=%s reason=%s", r.Seq, r.Offset, r.Class, r.Reason)
+	}
+	if len(list) != 3 || list[0].Seq != 2 || list[1].Seq != 3 || list[2].Seq != 4 {
+		t.Fatalf("unexpected rejections: %+v", list)
+	}
+	t.Logf("结果: 好记录 3 条全部投递, 坏记录 3 条按类别登记, 位点推进到 seq=%d", pos.Seq)
+}
+
+func TestBadRecordsNotReregisteredAfterRestart(t *testing.T) {
+	t.Log("覆盖: 重启续传重扫旧区间时, 坏记录不重复登记、不重复上报")
+	dir := t.TempDir()
+	srcPath := writeMixedJSONL(t)
+	out := filepath.Join(dir, "out.jsonl")
+	ckpt := filepath.Join(dir, "ckpt.json")
+	rejects := filepath.Join(dir, "rejects.jsonl")
+
+	// 第一轮：完整跑完
+	if _, err := runOnceWithRejects(t, srcPath, out, ckpt, rejects, 2); err != nil {
+		t.Fatal(err)
+	}
+	if got := countLines(t, rejects); got != 3 {
+		t.Fatalf("want 3 rejections after first run, got %d", got)
+	}
+
+	// 模拟崩溃后位点丢失：删掉检查点，旧区间被整体重扫
+	os.Remove(ckpt)
+	p, err := runOnceWithRejects(t, srcPath, out, ckpt, rejects, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 重扫到的坏记录全部去重：本轮新登记 0 条，拒绝文件不增长
+	if p.Stats.Rejected.Load() != 0 {
+		t.Fatalf("rejected=%d after rescan, want 0 (deduped)", p.Stats.Rejected.Load())
+	}
+	if got := countLines(t, rejects); got != 3 {
+		t.Fatalf("reject file grew after restart: %d lines, want 3", got)
+	}
+	// 下游幂等：重放好记录不产生重复行
+	if got := countLines(t, out); got != 3 {
+		t.Fatalf("output lines=%d after replay, want 3 (deduped)", got)
+	}
+	// 位点重新推进到源末尾
+	pos, _ := checkpoint.NewFileStore(ckpt).Load(context.Background(), "test")
+	if pos.Seq != 6 {
+		t.Fatalf("checkpoint seq=%d after rescan, want 6", pos.Seq)
+	}
+	t.Log("结果: 重扫 3 条坏记录均未重复登记, 输出无重复, 位点回到源末尾")
+}
+
+func TestCancelDoesNotAdvanceCheckpoint(t *testing.T) {
+	t.Log("覆盖: 取消立即生效, 取消后不再投递、不再推进位点, 统计关系自洽")
+	srcPath := writeJSONL(t, 2000)
+	dir := t.TempDir()
 	out := filepath.Join(dir, "out.jsonl")
 	ckpt := filepath.Join(dir, "ckpt.json")
 
-	_, err := runOnce(t, srcPath, out, ckpt, 2)
-	if !ierr.Is(err, ierr.ClassMissingField) {
-		t.Fatalf("want missing_field, got %v", err)
+	src, _ := jsonl.New(connector.Config{"path": srcPath, "name": "test"})
+	store := checkpoint.NewFileStore(ckpt)
+	pos, _ := store.Load(context.Background(), "test")
+	src.Open(context.Background(), pos)
+	defer src.Close()
+	sk := sink.NewFileSink(out)
+	defer sk.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	p := New(src, sk, store, Options{Workers: 4, QueueSize: 16, BatchSize: 8, Logger: testLogger()})
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+	err := p.Run(ctx)
+	if !ierr.Is(err, ierr.ClassCanceled) {
+		t.Fatalf("want canceled, got %v", err)
 	}
+
+	// 取消后：管线内记录的最近提交位点与存储中的位点一致
+	last := p.LastCommitted()
+	stored, _ := checkpoint.NewFileStore(ckpt).Load(context.Background(), "test")
+	if last != stored {
+		t.Fatalf("last committed %+v != stored %+v", last, stored)
+	}
+	// Run 已返回：提交数与位点必须稳定，不再增长
+	c1 := p.Stats.Committed.Load()
+	time.Sleep(100 * time.Millisecond)
+	if p.Stats.Committed.Load() != c1 {
+		t.Fatalf("committed count grew after cancel: %d -> %d", c1, p.Stats.Committed.Load())
+	}
+	stored2, _ := checkpoint.NewFileStore(ckpt).Load(context.Background(), "test")
+	if stored2 != stored {
+		t.Fatalf("checkpoint advanced after cancel: %+v -> %+v", stored, stored2)
+	}
+	// 统计自洽：提交次数不超过投递批次数，投递数不超过生产数
+	if p.Stats.Committed.Load() > p.Stats.Batches.Load() {
+		t.Fatalf("committed=%d > batches=%d", p.Stats.Committed.Load(), p.Stats.Batches.Load())
+	}
+	if p.Stats.Written.Load() > p.Stats.Produced.Load() {
+		t.Fatalf("written=%d > produced=%d", p.Stats.Written.Load(), p.Stats.Produced.Load())
+	}
+	t.Logf("结果: 取消后位点稳定在 seq=%d, committed=%d batches=%d written=%d produced=%d",
+		stored.Seq, c1, p.Stats.Batches.Load(), p.Stats.Written.Load(), p.Stats.Produced.Load())
 }

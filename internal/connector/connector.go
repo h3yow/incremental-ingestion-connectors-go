@@ -21,6 +21,8 @@ type Source interface {
 	// Open 从指定位点开始读取；重复初始化返回 duplicate_init。
 	Open(ctx context.Context, from checkpoint.Position) error
 	// Next 返回下一条原始记录及其后的位点；数据耗尽返回 source_exhausted 分类错误。
+	// 若记录本身无法按格式解析（record_unparseable）或内容不合规（record_invalid），
+	// 必须同时返回该坏记录之后的位点，调用方登记拒绝后可凭位点跳过并继续续读。
 	Next(ctx context.Context) (event.Record, checkpoint.Position, error)
 	// Close 释放资源，幂等。
 	Close() error
@@ -62,7 +64,7 @@ func (r *Registry) New(kind string, cfg Config) (Source, error) {
 	f, ok := r.factories[kind]
 	r.mu.RUnlock()
 	if !ok {
-		return nil, ierr.Newf(ierr.ClassMissingField, op,
+		return nil, ierr.Newf(ierr.ClassUnknownConnectorKind, op,
 			"unknown connector kind %q (registered: %v)", kind, r.Kinds())
 	}
 	src, err := f(cfg)

@@ -6,15 +6,15 @@ import (
 )
 
 func TestClassOf(t *testing.T) {
-	err := New(ClassMissingField, "op", "msg")
-	if ClassOf(err) != ClassMissingField {
+	err := New(ClassRecordInvalid, "op", "msg")
+	if ClassOf(err) != ClassRecordInvalid {
 		t.Fatalf("got %s", ClassOf(err))
 	}
 	if ClassOf(fmt.Errorf("boom")) != ClassInternal {
 		t.Fatal("non-framework error must be internal")
 	}
 	wrapped := fmt.Errorf("outer: %w", err)
-	if !Is(wrapped, ClassMissingField) {
+	if !Is(wrapped, ClassRecordInvalid) {
 		t.Fatal("Is must see through wrapping")
 	}
 }

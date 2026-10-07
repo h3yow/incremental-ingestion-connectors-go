@@ -105,14 +105,50 @@ func TestBadJSONRejected(t *testing.T) {
 	src := open(t, path, checkpoint.Position{Source: "test"})
 	defer src.Close()
 	_, _, err := src.Next(context.Background())
-	if !ierr.Is(err, ierr.ClassTypeMismatch) {
-		t.Fatalf("want type_mismatch, got %v", err)
+	if !ierr.Is(err, ierr.ClassRecordUnparseable) {
+		t.Fatalf("want record_unparseable, got %v", err)
 	}
+}
+
+// TestBadLineReturnsPositionAndContinues 覆盖：坏行返回 record_unparseable 及其后的
+// 位点，调用方跳过后续读不受影响；凭该位点续传不会重读坏行。
+func TestBadLineReturnsPositionAndContinues(t *testing.T) {
+	t.Log("覆盖: 坏行返回位点并可跳过续读, 续传不重读坏行")
+	path := writeFile(t, "{\"key\":\"a\",\"kind\":\"u\"}\nbad-line\n{\"key\":\"c\",\"kind\":\"u\"}\n")
+	src := open(t, path, checkpoint.Position{Source: "test"})
+	defer src.Close()
+	ctx := context.Background()
+
+	if _, _, err := src.Next(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// 坏行：返回分类错误 + 其后的位点
+	_, pos, err := src.Next(ctx)
+	if !ierr.Is(err, ierr.ClassRecordUnparseable) {
+		t.Fatalf("want record_unparseable, got %v", err)
+	}
+	if pos.Seq != 2 || pos.Offset <= 0 {
+		t.Fatalf("bad line should carry its position, got %+v", pos)
+	}
+	// 跳过后续读：下一条好记录正常返回
+	rec, pos3, err := src.Next(ctx)
+	if err != nil || rec["key"] != "c" || pos3.Seq != 3 {
+		t.Fatalf("after skip got rec=%v pos=%+v err=%v", rec, pos3, err)
+	}
+
+	// 凭坏行位点续传：直接读到 c，不重读坏行
+	src2 := open(t, path, pos)
+	defer src2.Close()
+	rec, pos4, err := src2.Next(ctx)
+	if err != nil || rec["key"] != "c" || pos4.Seq != 3 {
+		t.Fatalf("resume from bad-line position got rec=%v pos=%+v err=%v", rec, pos4, err)
+	}
+	t.Logf("结果: 坏行位点 %+v 可跳过续读, 续传直接读到 key=c", pos)
 }
 
 func TestMissingConfig(t *testing.T) {
 	_, err := New(connector.Config{})
-	if !ierr.Is(err, ierr.ClassMissingField) {
-		t.Fatalf("want missing_field, got %v", err)
+	if !ierr.Is(err, ierr.ClassConfigInvalid) {
+		t.Fatalf("want config_invalid, got %v", err)
 	}
 }

@@ -33,7 +33,7 @@ func New(cfg connector.Config) (connector.Source, error) {
 	const op = "csv.New"
 	path, ok := cfg["path"].(string)
 	if !ok || path == "" {
-		return nil, ierr.New(ierr.ClassMissingField, op, `config field "path" (string) is required`)
+		return nil, ierr.New(ierr.ClassConfigInvalid, op, `config field "path" (string) is required`)
 	}
 	name, _ := cfg["name"].(string)
 	if name == "" {
@@ -46,15 +46,15 @@ type source struct {
 	name string
 	path string
 
-	mu      sync.Mutex
-	file    *os.File
-	reader  *bufio.Reader
-	header  []string
-	offset  int64
-	seq     uint64
-	size    int64
-	opened  bool
-	closed  bool
+	mu     sync.Mutex
+	file   *os.File
+	reader *bufio.Reader
+	header []string
+	offset int64
+	seq    uint64
+	size   int64
+	opened bool
+	closed bool
 }
 
 func (s *source) Name() string { return s.name }
@@ -96,7 +96,7 @@ func (s *source) Open(ctx context.Context, from checkpoint.Position) error {
 	header, err := parseLine(hdr)
 	if err != nil {
 		f.Close()
-		return ierr.Wrap(ierr.ClassTypeMismatch, op, err)
+		return ierr.Wrap(ierr.ClassRecordUnparseable, op, err)
 	}
 	s.header = header
 	headerEnd := int64(len(hdr))
@@ -146,11 +146,17 @@ func (s *source) Next(ctx context.Context) (event.Record, checkpoint.Position, e
 		}
 		fields, err := parseLine(line)
 		if err != nil {
-			return nil, checkpoint.Position{}, ierr.Wrap(ierr.ClassTypeMismatch, op, err)
+			// 整行无法按 CSV 解析：坏记录占用一个序号并返回其后的位点，
+			// 调用方登记拒绝后可凭该位点跳过本行继续续读。
+			s.seq++
+			return nil, checkpoint.Position{Source: s.name, Offset: s.offset, Seq: s.seq},
+				ierr.Wrap(ierr.ClassRecordUnparseable, op, err)
 		}
 		rec, err := s.toRecord(fields)
 		if err != nil {
-			return nil, checkpoint.Position{}, err
+			// 记录内容不合规：同样返回其后的位点，支持跳过续读。
+			s.seq++
+			return nil, checkpoint.Position{Source: s.name, Offset: s.offset, Seq: s.seq}, err
 		}
 		s.seq++
 		return rec, checkpoint.Position{Source: s.name, Offset: s.offset, Seq: s.seq}, nil
@@ -161,7 +167,7 @@ func (s *source) Next(ctx context.Context) (event.Record, checkpoint.Position, e
 func (s *source) toRecord(fields []string) (event.Record, error) {
 	const op = "csv.Next"
 	if len(fields) != len(s.header) {
-		return nil, ierr.Newf(ierr.ClassTypeMismatch, op,
+		return nil, ierr.Newf(ierr.ClassRecordInvalid, op,
 			"row has %d fields, header has %d", len(fields), len(s.header))
 	}
 	rec := event.Record{}
@@ -176,7 +182,7 @@ func (s *source) toRecord(fields []string) (event.Record, error) {
 			}
 			var p map[string]any
 			if err := json.Unmarshal([]byte(v), &p); err != nil {
-				return nil, ierr.Newf(ierr.ClassTypeMismatch, op, "payload column is not a JSON object: %v", err)
+				return nil, ierr.Newf(ierr.ClassRecordInvalid, op, "payload column is not a JSON object: %v", err)
 			}
 			rec["payload"] = p
 		case "ts":

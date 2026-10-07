@@ -2,10 +2,13 @@
 //
 // 语义：至少一次拉取 + 幂等下游 = 不丢不重。
 //   - 生产者从 Source 逐条拉取并归一化，写入有界队列（背压边界）。
+//   - 坏记录（record_invalid / record_unparseable）按类别登记到 RejectStore
+//     后跳过，其位点直接进入提交流，本轮剩余好记录全部投递，位点推进到源末尾；
+//     重启重扫旧区间时 RejectStore 去重，不重复登记、不重复上报。
 //   - worker 从队列攒批，写 Sink 成功后把位点交给提交器。
 //   - 提交器只按 seq 连续前缀提交检查点，崩溃后从最近提交位点续传，
 //     已写入但未提交的事件由 Sink 幂等去重。
-//   - 取消时不再提交新位点，在途批次被丢弃，重启后重放，不产生重复。
+//   - 取消时不再投递、不再提交新位点，在途批次被丢弃，重启后重放，不产生重复。
 package pipeline
 
 import (
@@ -19,15 +22,17 @@ import (
 	"github.com/h3yow/incremental-ingestion-connectors-go/internal/connector"
 	ierr "github.com/h3yow/incremental-ingestion-connectors-go/internal/errors"
 	"github.com/h3yow/incremental-ingestion-connectors-go/internal/event"
+	"github.com/h3yow/incremental-ingestion-connectors-go/internal/reject"
 	"github.com/h3yow/incremental-ingestion-connectors-go/internal/sink"
 )
 
 // Options 控制管线行为。
 type Options struct {
-	Workers   int // 并发 worker 数（<1 时取 1）
-	QueueSize int // 队列容量（背压边界，<1 时取 1）
-	BatchSize int // 每批提交/投递的事件数（<1 时取 1）
-	Logger    *slog.Logger
+	Workers     int          // 并发 worker 数（<1 时取 1）
+	QueueSize   int          // 队列容量（背压边界，<1 时取 1）
+	BatchSize   int          // 每批提交/投递的事件数（<1 时取 1）
+	RejectStore reject.Store // 坏记录拒绝登记存储（nil 时用进程内存储，不持久化）
+	Logger      *slog.Logger
 }
 
 func (o *Options) normalize() {
@@ -40,6 +45,9 @@ func (o *Options) normalize() {
 	if o.BatchSize < 1 {
 		o.BatchSize = 1
 	}
+	if o.RejectStore == nil {
+		o.RejectStore = reject.NewMemoryStore()
+	}
 	if o.Logger == nil {
 		o.Logger = slog.Default()
 	}
@@ -51,6 +59,7 @@ type Stats struct {
 	Written   atomic.Uint64 // 已成功投递事件数
 	Committed atomic.Uint64 // 已提交位点数
 	Batches   atomic.Uint64 // 已投递批次数
+	Rejected  atomic.Uint64 // 本轮新登记的坏记录数（不含重启去重的）
 }
 
 type item struct {
@@ -78,11 +87,22 @@ type Pipeline struct {
 	opts  Options
 
 	Stats Stats
+
+	lastCommitted atomic.Value // checkpoint.Position：最近提交的位点（取消后不再变化）
 }
 
 func New(src connector.Source, sk sink.Sink, store checkpoint.Store, opts Options) *Pipeline {
 	opts.normalize()
 	return &Pipeline{src: src, sk: sk, store: store, opts: opts}
+}
+
+// LastCommitted 返回本轮最近提交的位点；尚未提交时返回零值。
+// Run 返回后该值不再变化，可用于校验「取消后位点不再推进」。
+func (p *Pipeline) LastCommitted() checkpoint.Position {
+	if v, ok := p.lastCommitted.Load().(checkpoint.Position); ok {
+		return v
+	}
+	return checkpoint.Position{}
 }
 
 // Run 运行管线直到源耗尽或 ctx 取消。
@@ -92,7 +112,9 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	queue := make(chan item, p.opts.QueueSize)
 	done := make(chan batchDone, p.opts.Workers)
 
-	runCtx, cancel := context.WithCancel(context.Background())
+	// runCtx 派生自外部 ctx：外部取消立即传播到 worker/提交器，
+	// 内部失败（fail）也经由同一 cancel 让全管线退出。
+	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	var (
@@ -122,47 +144,84 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	}
 
 	// 生产者：拉取 -> 归一化 -> 入队（受背压约束）。
-	prodErr := p.produce(ctx, runCtx, queue, log)
+	prodErr := p.produce(ctx, runCtx, queue, done, log)
 	close(queue)
 	workers.Wait()
-	close(done)     // worker 全部退出后才关闭上报通道
+	close(done)      // worker 全部退出后才关闭上报通道
 	committer.Wait() // 等待提交器排空
 
-	if prodErr != nil {
-		return prodErr
+	result := prodErr
+	if result == nil {
+		if err, _ := firstErr.Load().(error); err != nil {
+			result = err
+		}
 	}
-	if err, _ := firstErr.Load().(error); err != nil {
-		return err
+	if result == nil {
+		if err := ctx.Err(); err != nil {
+			result = ierr.Wrap(ierr.ClassCanceled, "pipeline.Run", err)
+		}
 	}
-	if err := ctx.Err(); err != nil {
-		return ierr.Wrap(ierr.ClassCanceled, "pipeline.Run", err)
+
+	// 结束汇总：投递数、提交数、位点与拒绝分类统计可对照，关系自洽。
+	// committed <= written <= produced + rejected；取消时 written 可能大于
+	// committed 覆盖的事件数（已写未提交部分将由重启重放、下游去重兜住）。
+	last := p.LastCommitted()
+	attrs := []any{
+		"source", p.src.Name(),
+		"produced", p.Stats.Produced.Load(),
+		"written", p.Stats.Written.Load(),
+		"batches", p.Stats.Batches.Load(),
+		"committed", p.Stats.Committed.Load(),
+		"rejected", p.Stats.Rejected.Load(),
+		"last_committed_offset", last.Offset,
+		"last_committed_seq", last.Seq,
 	}
-	return nil
+	if sum, serr := p.opts.RejectStore.Summary(context.Background(), p.src.Name()); serr == nil && len(sum) > 0 {
+		attrs = append(attrs, "reject_summary", sum)
+	}
+	if result != nil {
+		log.Error("pipeline finished with error",
+			append(attrs, "error_class", string(ierr.ClassOf(result)), "error", result)...)
+	} else {
+		log.Info("pipeline finished", attrs...)
+	}
+	return result
 }
 
 // produce 从源拉取记录、归一化并写入队列。源耗尽返回 nil。
-func (p *Pipeline) produce(ctx, runCtx context.Context, queue chan<- item, log *slog.Logger) error {
+// 坏记录（记录级错误）登记拒绝后跳过，不再中止整轮同步。
+func (p *Pipeline) produce(ctx, runCtx context.Context, queue chan<- item, done chan<- batchDone, log *slog.Logger) error {
 	const op = "pipeline.produce"
 	var idx uint64
 	for {
+		if runCtx.Err() != nil && ctx.Err() == nil {
+			return nil // 内部失败：退出即可，错误已由 fail 记录
+		}
 		rec, pos, err := p.src.Next(ctx)
 		if err != nil {
-			if ierr.Is(err, ierr.ClassSourceExhausted) {
+			switch {
+			case ierr.Is(err, ierr.ClassSourceExhausted):
 				log.Info("source exhausted", "source", p.src.Name(), "produced", p.Stats.Produced.Load())
 				return nil
-			}
-			if ierr.Is(err, ierr.ClassCanceled) {
+			case ierr.Is(err, ierr.ClassCanceled):
+				return err
+			case ierr.IsRecordLevel(err):
+				// 整行/整段无法按格式解析：位点随错误返回，登记拒绝后跳过续读。
+				if rerr := p.reject(ctx, runCtx, pos, err, done, &idx, log); rerr != nil {
+					return rerr
+				}
+				continue
+			default:
 				return err
 			}
-			return err
 		}
 		ev, err := event.Normalize(p.src.Name(), pos.Seq, rec)
 		if err != nil {
-			// 记录级错误：明确拒绝并中止，不静默跳过。
-			log.Error("record rejected",
-				"source", p.src.Name(), "seq", pos.Seq,
-				"error_class", string(ierr.ClassOf(err)), "error", err)
-			return err
+			// 记录内容不合规：登记拒绝后跳过续读，位点越过坏记录。
+			if rerr := p.reject(ctx, runCtx, pos, err, done, &idx, log); rerr != nil {
+				return rerr
+			}
+			continue
 		}
 		it := item{idx: idx, ev: ev, pos: pos}
 		idx++
@@ -181,13 +240,52 @@ func (p *Pipeline) produce(ctx, runCtx context.Context, queue chan<- item, log *
 				timer.Reset(backpressureLogInterval)
 			case <-runCtx.Done():
 				timer.Stop()
+				if ctx.Err() != nil {
+					return ierr.Wrap(ierr.ClassCanceled, op, ctx.Err())
+				}
 				return nil
-			case <-ctx.Done():
-				timer.Stop()
-				return ierr.Wrap(ierr.ClassCanceled, op, ctx.Err())
 			}
 		}
 	next:
+	}
+}
+
+// reject 登记一条坏记录，并把其位点直接送入提交流（与已投递事件一样占一个 idx），
+// 使检查点能越过坏记录、最终推进到源末尾。
+// 已登记过的坏记录（重启重扫旧区间）不重复登记、不重复上报。
+func (p *Pipeline) reject(ctx, runCtx context.Context, pos checkpoint.Position, cause error, done chan<- batchDone, idx *uint64, log *slog.Logger) error {
+	const op = "pipeline.reject"
+	if pos.Source == "" {
+		pos.Source = p.src.Name()
+	}
+	r := reject.Rejection{
+		Source: pos.Source, Seq: pos.Seq, Offset: pos.Offset,
+		Class: string(ierr.ClassOf(cause)), Reason: cause.Error(),
+	}
+	// 先持久化登记（fsync），再放行位点：崩溃窗口内重启重扫由存储去重兜住。
+	added, err := p.opts.RejectStore.Add(ctx, r)
+	if err != nil {
+		return err
+	}
+	if added {
+		p.Stats.Rejected.Add(1)
+		log.Warn("record rejected",
+			"source", r.Source, "seq", r.Seq, "offset", r.Offset,
+			"error_class", r.Class, "reason", r.Reason)
+	} else {
+		log.Debug("known bad record skipped (already recorded, not reported again)",
+			"source", r.Source, "seq", r.Seq, "offset", r.Offset, "error_class", r.Class)
+	}
+	ref := posRef{idx: *idx, pos: pos}
+	*idx++
+	select {
+	case done <- batchDone{items: []posRef{ref}}:
+		return nil
+	case <-runCtx.Done():
+		if ctx.Err() != nil {
+			return ierr.Wrap(ierr.ClassCanceled, op, ctx.Err())
+		}
+		return nil // 内部失败：退出即可
 	}
 }
 
@@ -200,6 +298,9 @@ func (p *Pipeline) worker(ctx context.Context, id int, queue <-chan item, done c
 	flush := func() bool {
 		if len(batch) == 0 {
 			return true
+		}
+		if err := ctx.Err(); err != nil {
+			return false // 取消后立即生效：不再投递在途批次
 		}
 		evs := make([]event.Event, len(batch))
 		for i, it := range batch {
@@ -281,6 +382,9 @@ func (p *Pipeline) committer(ctx context.Context, done <-chan batchDone, log *sl
 			if !advanced {
 				continue
 			}
+			if ctx.Err() != nil {
+				return // 取消后立即生效：不再推进位点
+			}
 			if err := p.store.Commit(ctx, last); err != nil {
 				log.Error("checkpoint commit failed",
 					"offset", last.Offset, "seq", last.Seq,
@@ -288,6 +392,7 @@ func (p *Pipeline) committer(ctx context.Context, done <-chan batchDone, log *sl
 				// 提交失败不致命：重启后从旧位点重放，由 Sink 幂等去重。
 			} else {
 				p.Stats.Committed.Add(1)
+				p.lastCommitted.Store(last)
 				log.Info("checkpoint committed",
 					"source", last.Source, "offset", last.Offset, "seq", last.Seq)
 			}
